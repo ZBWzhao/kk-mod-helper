@@ -1,0 +1,8 @@
+.venv/
+data/
+reports/
+__pycache__/
+*.py[cod]
+*.partial
+build/
+dist/
