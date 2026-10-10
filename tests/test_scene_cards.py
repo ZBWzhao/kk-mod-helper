@@ -5,11 +5,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from kk_mod_helper.gui import _items_for_selected_cards, _png_preview_data, _scene_cards_from_report
+from kk_mod_helper.gui import (
+    _items_for_selected_cards,
+    _png_preview_data,
+    _scene_cards_from_report,
+    _selection_marker,
+)
 from kk_mod_helper.reporting import build_missing_report
 
 
 class SceneCardReportTests(unittest.TestCase):
+    def test_mod_selection_marker_distinguishes_unavailable_items(self) -> None:
+        self.assertEqual(_selection_marker(False, True), "☐")
+        self.assertEqual(_selection_marker(True, True), "☑")
+        self.assertEqual(_selection_marker(False, False), "—")
+
     def test_report_keeps_all_scene_dependencies(self) -> None:
         card = r"D:\Games\Koikatu\UserData\Studio\scene\example.png"
         requirements = {

@@ -44,6 +44,12 @@ def _format_size(value: int | None) -> str:
     return "未知"
 
 
+def _selection_marker(selected: bool, selectable: bool) -> str:
+    if selected:
+        return "☑"
+    return "☐" if selectable else "—"
+
+
 def _load_saved_game_dir() -> str:
     if DEFAULT_GAME:
         return DEFAULT_GAME
@@ -189,6 +195,7 @@ class App:
         self.scene_cards: dict[str, dict] = {}
         self.selected_scene_paths: set[str] = set()
         self.scene_preview_image: PhotoImage | None = None
+        self.last_checkbox_click: tuple[str, int] = ("", -1000)
 
         self.game_var = StringVar(value=_load_saved_game_dir())
         self.report_label_var = StringVar(value="尚未生成报告")
@@ -283,6 +290,7 @@ class App:
         self.tree.configure(yscrollcommand=yscroll.set)
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
         yscroll.pack(side=RIGHT, fill="y")
+        self.tree.bind("<ButtonRelease-1>", self._handle_mod_table_click)
         self.tree.bind("<Double-1>", self._toggle_selected_row)
         self.tree.bind("<Button-3>", self._show_tree_menu)
         self.tree.bind("<Control-c>", self.copy_selected_mod_name)
@@ -296,7 +304,7 @@ class App:
         self.log = Text(root, height=8, wrap="word")
         self.log.pack(fill=X, padx=10, pady=(4, 10))
         self._write(
-            "程序会自动管理 JSON 报告。用 Ctrl/Shift+单击可高亮多行，"
+            "程序会自动管理 JSON 报告。单击第一列的 ☐ 可直接勾选；用 Ctrl/Shift+单击可高亮多行，"
             "再点击“勾选高亮项”或按空格键；Ctrl+C 可批量复制名称。\n"
         )
         self.root.after(100, self._drain_messages)
@@ -746,7 +754,7 @@ class App:
         if status == "retrying" and state.get("attempt"):
             reason = f"第 {state['attempt']} 次重试；{reason}".strip("；")
         values = (
-            "☑" if key in self.selected_guids else "☐",
+            _selection_marker(key in self.selected_guids, self._is_downloadable_key(key)),
             STATUS_TEXT.get(status, status),
             item.get("name") or item.get("filename") or "未知模组",
             item.get("guid", ""),
@@ -781,9 +789,35 @@ class App:
         key = self.tree.identify_row(event.y)
         if not key or key not in self.items_by_guid:
             return
+        if self.tree.identify_column(event.x) == "#1":
+            return "break"
+        self._toggle_mod_key(key)
+
+    def _handle_mod_table_click(self, event) -> str | None:
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return None
+        if self.tree.identify_column(event.x) != "#1":
+            return None
+        key = self.tree.identify_row(event.y)
+        if not key or key not in self.items_by_guid:
+            return None
+        last_key, last_time = self.last_checkbox_click
+        if key == last_key and int(event.time) - last_time < 350:
+            return "break"
+        self.last_checkbox_click = (key, int(event.time))
+        self.tree.selection_set(key)
+        self.tree.focus(key)
+        self._toggle_mod_key(key)
+        return "break"
+
+    def _toggle_mod_key(self, key: str) -> None:
         if not self._is_downloadable_key(key):
             status = self.task_states.get(key, {}).get("status") or self.items_by_guid[key].get("status")
-            message = "这个依赖已经安装，无需重复下载。" if status in {"satisfied", "installed", "skipped"} else "这个项目还没有解析到下载地址。"
+            message = (
+                "这个依赖已经安装，无需重复下载。"
+                if status in {"satisfied", "installed", "skipped"}
+                else "这个缺失 MOD 还没有解析到下载地址，暂时无法加入下载任务。"
+            )
             messagebox.showinfo("不可下载", message)
             return
         if key in self.selected_guids:
@@ -886,6 +920,11 @@ class App:
         }
         for key in self.items_by_guid:
             self._refresh_row(key)
+        if not self.selected_guids:
+            messagebox.showinfo(
+                "没有可下载项",
+                "当前列表中的缺失 MOD 都还没有解析到下载地址。请先更新公开索引，再重新执行追加解析。",
+            )
 
     def select_failed(self) -> None:
         self.selected_guids = {
