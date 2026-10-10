@@ -106,6 +106,8 @@ class App:
         self.selection_buttons = [
             Button(selection_frame, text="全选可下载", command=self.select_downloadable),
             Button(selection_frame, text="只选失败任务", command=self.select_failed),
+            Button(selection_frame, text="勾选高亮项", command=self.select_highlighted),
+            Button(selection_frame, text="取消高亮项", command=self.deselect_highlighted),
             Button(selection_frame, text="清除选择", command=self.clear_selection),
             Button(selection_frame, text="复制模组名称", command=self.copy_selected_mod_name),
         ]
@@ -121,7 +123,7 @@ class App:
         columns = ("selected", "status", "name", "guid", "size", "cards", "progress", "reason")
         table_frame = Frame(root)
         table_frame.pack(fill=BOTH, expand=True, padx=10, pady=4)
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
         headings = {
             "selected": "选择",
             "status": "状态",
@@ -143,6 +145,7 @@ class App:
         self.tree.bind("<Double-1>", self._toggle_selected_row)
         self.tree.bind("<Button-3>", self._show_tree_menu)
         self.tree.bind("<Control-c>", self.copy_selected_mod_name)
+        self.tree.bind("<space>", self._toggle_highlighted_rows)
 
         self.tree_menu = Menu(self.root, tearoff=False)
         self.tree_menu.add_command(label="复制模组名称", command=self.copy_selected_mod_name)
@@ -152,8 +155,8 @@ class App:
         self.log = Text(root, height=8, wrap="word")
         self.log.pack(fill=X, padx=10, pady=(4, 10))
         self._write(
-            "程序会自动管理 JSON 报告。双击任务行可勾选或取消；"
-            "选中一行后可点击“复制模组名称”、右键或按 Ctrl+C 复制。\n"
+            "程序会自动管理 JSON 报告。用 Ctrl/Shift+单击可高亮多行，"
+            "再点击“勾选高亮项”或按空格键；Ctrl+C 可批量复制名称。\n"
         )
         self.root.after(100, self._drain_messages)
         self.root.after(200, self._startup)
@@ -332,8 +335,6 @@ class App:
                 "total": int(item.get("file_size") or 0),
             }
             self.task_states[key] = state
-            if status == "downloadable":
-                self.selected_guids.add(key)
 
         result_path = report_path.with_name(report_path.stem + "_install_results.json")
         if result_path.exists():
@@ -412,12 +413,21 @@ class App:
             self.selected_guids.add(key)
         self._refresh_row(key)
 
-    def _selected_tree_key(self) -> str | None:
-        selected = self.tree.selection()
-        if not selected:
-            return None
-        key = str(selected[0])
-        return key if key in self.items_by_guid else None
+    def _selected_tree_keys(self) -> list[str]:
+        return [str(key) for key in self.tree.selection() if str(key) in self.items_by_guid]
+
+    def _toggle_highlighted_rows(self, _event=None) -> str:
+        keys = [key for key in self._selected_tree_keys() if self.items_by_guid[key].get("status") == "downloadable"]
+        if not keys:
+            messagebox.showinfo("无可下载项", "请先高亮至少一个状态为“等待下载”的模组。")
+            return "break"
+        if all(key in self.selected_guids for key in keys):
+            self.selected_guids.difference_update(keys)
+        else:
+            self.selected_guids.update(keys)
+        for key in keys:
+            self._refresh_row(key)
+        return "break"
 
     def _copy_text(self, text: str, description: str) -> None:
         self.root.clipboard_clear()
@@ -426,43 +436,70 @@ class App:
         self._write(f"已复制{description}：{text}\n")
 
     def copy_selected_mod_name(self, _event=None) -> str:
-        key = self._selected_tree_key()
-        if not key:
-            messagebox.showinfo("请先选择", "请先单击选中一行模组。")
+        keys = self._selected_tree_keys()
+        if not keys:
+            messagebox.showinfo("请先选择", "请先单击选中至少一行模组。")
             return "break"
-        item = self.items_by_guid[key]
-        name = str(item.get("name") or item.get("filename") or "未知模组")
-        self._copy_text(name, "模组名称")
+        names = [
+            str(self.items_by_guid[key].get("name") or self.items_by_guid[key].get("filename") or "未知模组")
+            for key in keys
+        ]
+        self._copy_text("\n".join(names), f" {len(names)} 个模组名称")
         return "break"
 
     def copy_selected_guid(self) -> None:
-        key = self._selected_tree_key()
-        if not key:
-            messagebox.showinfo("请先选择", "请先单击选中一行模组。")
+        keys = self._selected_tree_keys()
+        if not keys:
+            messagebox.showinfo("请先选择", "请先单击选中至少一行模组。")
             return
-        guid = str(self.items_by_guid[key].get("guid") or "")
-        self._copy_text(guid, " GUID")
+        guids = [str(self.items_by_guid[key].get("guid") or "") for key in keys]
+        self._copy_text("\n".join(guids), f" {len(guids)} 个 GUID")
 
     def copy_selected_mod_info(self) -> None:
-        key = self._selected_tree_key()
-        if not key:
-            messagebox.showinfo("请先选择", "请先单击选中一行模组。")
+        keys = self._selected_tree_keys()
+        if not keys:
+            messagebox.showinfo("请先选择", "请先单击选中至少一行模组。")
             return
-        item = self.items_by_guid[key]
-        name = str(item.get("name") or item.get("filename") or "未知模组")
-        guid = str(item.get("guid") or "")
-        self._copy_text(f"{name}\t{guid}", "模组名称和 GUID")
+        lines = []
+        for key in keys:
+            item = self.items_by_guid[key]
+            name = str(item.get("name") or item.get("filename") or "未知模组")
+            lines.append(f"{name}\t{str(item.get('guid') or '')}")
+        self._copy_text("\n".join(lines), f" {len(lines)} 个模组的名称和 GUID")
 
     def _show_tree_menu(self, event) -> None:
         key = self.tree.identify_row(event.y)
         if not key or key not in self.items_by_guid:
             return
-        self.tree.selection_set(key)
+        if key not in self.tree.selection():
+            self.tree.selection_set(key)
         self.tree.focus(key)
         try:
             self.tree_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.tree_menu.grab_release()
+
+    def select_highlighted(self) -> None:
+        highlighted = self._selected_tree_keys()
+        if not highlighted:
+            messagebox.showinfo("请先选择", "请先用 Ctrl/Shift+单击高亮要下载的模组。")
+            return
+        downloadable = [key for key in highlighted if self.items_by_guid[key].get("status") == "downloadable"]
+        self.selected_guids.update(downloadable)
+        for key in downloadable:
+            self._refresh_row(key)
+        skipped = len(highlighted) - len(downloadable)
+        self._write(f"已勾选 {len(downloadable)} 个高亮模组；跳过 {skipped} 个不可下载项。\n")
+
+    def deselect_highlighted(self) -> None:
+        highlighted = self._selected_tree_keys()
+        if not highlighted:
+            messagebox.showinfo("请先选择", "请先用 Ctrl/Shift+单击高亮要取消的模组。")
+            return
+        self.selected_guids.difference_update(highlighted)
+        for key in highlighted:
+            self._refresh_row(key)
+        self._write(f"已取消勾选 {len(highlighted)} 个高亮项。\n")
 
     def select_downloadable(self) -> None:
         self.selected_guids = {
