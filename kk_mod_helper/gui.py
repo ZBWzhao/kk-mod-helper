@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
 import threading
 import traceback
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Button, Entry, Frame, Label, Menu, StringVar, Text, Tk, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, Button, Entry, Frame, Label, Menu, PhotoImage, StringVar, Text, Tk, Toplevel, filedialog, messagebox
 from tkinter import ttk
 
 from .catalog import crawl_public_index, resolve_report
@@ -28,6 +29,7 @@ STATUS_TEXT = {
     "skipped": "已存在",
     "failed": "下载失败",
     "cancelled": "已取消",
+    "satisfied": "已安装",
 }
 
 
@@ -47,6 +49,122 @@ def _load_saved_game_dir() -> str:
         return DEFAULT_GAME
     if not SETTINGS_PATH.exists():
         return ""
+
+
+def _scene_cards_from_report(data: dict) -> list[dict]:
+    """Return scene-card records, deriving a missing-only index for old reports."""
+    records = [
+        dict(card)
+        for card in data.get("cards", [])
+        if str(card.get("card_type") or "").casefold() == "scene" and card.get("path")
+    ]
+    if records:
+        return sorted(records, key=lambda card: str(card.get("path") or "").casefold())
+
+    by_path: dict[str, dict] = {}
+    for item in data.get("items", []):
+        for card in item.get("cards", []):
+            if str(card.get("card_type") or "").casefold() != "scene":
+                continue
+            path = str(card.get("path") or "")
+            if not path:
+                continue
+            record = by_path.setdefault(
+                path,
+                {
+                    "path": path,
+                    "filename": card.get("filename") or Path(path).name,
+                    "card_type": "scene",
+                    "mods": [],
+                },
+            )
+            record["mods"].append(
+                {
+                    "guid": item.get("guid", ""),
+                    "name": item.get("name", ""),
+                    "filename": item.get("filename", ""),
+                    "file_size": item.get("file_size", 0),
+                    "installed": False,
+                }
+            )
+    for record in by_path.values():
+        record["mod_count"] = len(record["mods"])
+        record["missing_count"] = len(record["mods"])
+    return sorted(by_path.values(), key=lambda card: str(card.get("path") or "").casefold())
+
+
+def _items_for_selected_cards(
+    all_missing_items: dict[str, dict],
+    scene_cards: dict[str, dict],
+    selected_paths: set[str],
+) -> dict[str, dict]:
+    if not selected_paths:
+        return dict(all_missing_items)
+
+    visible: dict[str, dict] = {}
+    for path in sorted(selected_paths, key=str.casefold):
+        card = scene_cards.get(path)
+        if not card:
+            continue
+        for dependency in card.get("mods", []):
+            guid = str(dependency.get("guid") or "").strip()
+            if not guid:
+                continue
+            key = guid.casefold()
+            if key in all_missing_items:
+                item = dict(all_missing_items[key])
+                item["cards"] = [
+                    entry
+                    for entry in item.get("cards", [])
+                    if str(entry.get("path") or "") in selected_paths
+                ]
+            else:
+                item = {
+                    "guid": guid,
+                    "status": "satisfied" if dependency.get("installed") else "not_found",
+                    "reason": (
+                        "游戏 mods 目录中已安装"
+                        if dependency.get("installed")
+                        else "此依赖未出现在当前缺失报告中"
+                    ),
+                    "name": dependency.get("name", ""),
+                    "author": dependency.get("author", ""),
+                    "filename": dependency.get("filename", ""),
+                    "file_size": int(dependency.get("file_size") or 0),
+                    "url": "",
+                    "cards": [
+                        {
+                            "path": path,
+                            "filename": card.get("filename") or Path(path).name,
+                            "card_type": "scene",
+                        }
+                    ],
+                }
+            if key in visible:
+                known_paths = {str(entry.get("path") or "") for entry in visible[key].get("cards", [])}
+                visible[key].setdefault("cards", []).extend(
+                    entry for entry in item.get("cards", []) if str(entry.get("path") or "") not in known_paths
+                )
+            else:
+                visible[key] = item
+    return visible
+
+
+def _png_preview_data(path: Path) -> str:
+    """Trim KK data appended after PNG IEND and return Tk-compatible base64."""
+    data = path.read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("不是有效的 PNG 场景卡")
+    cursor = 8
+    while cursor + 12 <= len(data):
+        length = int.from_bytes(data[cursor : cursor + 4], "big")
+        chunk_type = data[cursor + 4 : cursor + 8]
+        cursor += 12 + length
+        if cursor > len(data):
+            break
+        if chunk_type == b"IEND":
+            return base64.b64encode(data[:cursor]).decode("ascii")
+    raise ValueError("PNG 场景卡缺少 IEND 数据块")
     try:
         data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         return str(data.get("game_dir") or "")
@@ -64,9 +182,13 @@ class App:
         self.stop_event = threading.Event()
         self.current_report: Path | None = None
         self.report_data: dict = {}
+        self.all_items_by_guid: dict[str, dict] = {}
         self.items_by_guid: dict[str, dict] = {}
         self.task_states: dict[str, dict] = {}
         self.selected_guids: set[str] = set()
+        self.scene_cards: dict[str, dict] = {}
+        self.selected_scene_paths: set[str] = set()
+        self.scene_preview_image: PhotoImage | None = None
 
         self.game_var = StringVar(value=_load_saved_game_dir())
         self.report_label_var = StringVar(value="尚未生成报告")
@@ -100,6 +222,25 @@ class App:
             justify=LEFT,
         ).pack(fill=X, padx=10, pady=(2, 2))
         Label(root, textvariable=self.report_label_var, anchor="w", fg="#555555").pack(fill=X, padx=10, pady=(0, 6))
+
+        scene_filter_frame = Frame(root)
+        scene_filter_frame.pack(fill=X, padx=10, pady=(0, 5))
+        self.scene_filter_button = Button(
+            scene_filter_frame,
+            text="选择场景卡…",
+            command=self.open_scene_card_selector,
+        )
+        self.scene_filter_button.pack(side=LEFT, padx=(0, 6))
+        self.clear_scene_filter_button = Button(
+            scene_filter_frame,
+            text="显示全部缺失 MOD",
+            command=self.clear_scene_filter,
+        )
+        self.clear_scene_filter_button.pack(side=LEFT, padx=(0, 8))
+        self.scene_filter_var = StringVar(value="当前：全部卡片的缺失 MOD")
+        Label(scene_filter_frame, textvariable=self.scene_filter_var, anchor="w", fg="#245a8d").pack(
+            side=LEFT, fill=X, expand=True
+        )
 
         selection_frame = Frame(root)
         selection_frame.pack(fill=X, padx=10, pady=(2, 5))
@@ -184,7 +325,11 @@ class App:
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for button in self.action_buttons + self.selection_buttons + [self.download_button]:
+        for button in self.action_buttons + self.selection_buttons + [
+            self.download_button,
+            self.scene_filter_button,
+            self.clear_scene_filter_button,
+        ]:
             button.configure(state=state)
 
     def _run(self, title: str, function) -> None:
@@ -315,9 +460,13 @@ class App:
         data = json.loads(report_path.read_text(encoding="utf-8"))
         self.current_report = report_path
         self.report_data = data
+        self.all_items_by_guid.clear()
         self.items_by_guid.clear()
         self.task_states.clear()
         self.selected_guids.clear()
+        self.selected_scene_paths.clear()
+        scene_records = _scene_cards_from_report(data)
+        self.scene_cards = {str(card["path"]): card for card in scene_records}
         self.tree.delete(*self.tree.get_children())
 
         for item in data.get("items", []):
@@ -325,7 +474,7 @@ class App:
             if not guid:
                 continue
             key = guid.casefold()
-            self.items_by_guid[key] = item
+            self.all_items_by_guid[key] = item
             status = str(item.get("status") or "unresolved")
             state = {
                 "guid": guid,
@@ -349,8 +498,7 @@ class App:
             except Exception as exc:
                 self._write(f"读取上次下载结果失败：{exc}\n")
 
-        for key in self.items_by_guid:
-            self._refresh_row(key)
+        self._apply_scene_filter()
         summary = data.get("summary", {})
         self.report_label_var.set(
             f"当前报告：{report_path.name}｜缺失 {summary.get('total', len(self.items_by_guid))}｜"
@@ -358,11 +506,233 @@ class App:
         )
         self.root.title(f"KK 缺失 MOD 批量安装器 - {report_path.name}")
         failed = sum(state.get("status") == "failed" for state in self.task_states.values())
-        self._write(f"已自动载入报告：{report_path.name}。上次失败任务：{failed}。\n")
+        self._write(
+            f"已自动载入报告：{report_path.name}。识别到 {len(self.scene_cards)} 张场景卡；"
+            f"上次失败任务：{failed}。\n"
+        )
+
+    def _apply_scene_filter(self) -> None:
+        self.items_by_guid = _items_for_selected_cards(
+            self.all_items_by_guid,
+            self.scene_cards,
+            self.selected_scene_paths,
+        )
+        selectable = {
+            key for key, item in self.items_by_guid.items() if item.get("status") == "downloadable"
+        }
+        self.selected_guids.intersection_update(selectable)
+        self.tree.delete(*self.tree.get_children())
+        for key in self.items_by_guid:
+            self._refresh_row(key)
+
+        if self.selected_scene_paths:
+            missing_count = sum(item.get("status") != "satisfied" for item in self.items_by_guid.values())
+            installed_count = len(self.items_by_guid) - missing_count
+            self.scene_filter_var.set(
+                f"当前：已选择 {len(self.selected_scene_paths)} 张场景卡｜"
+                f"依赖 {len(self.items_by_guid)}｜缺失 {missing_count}｜已安装 {installed_count}"
+            )
+        else:
+            self.scene_filter_var.set(
+                f"当前：全部卡片的缺失 MOD（{len(self.all_items_by_guid)} 项）"
+            )
+
+    def clear_scene_filter(self) -> None:
+        if not self.selected_scene_paths:
+            return
+        self.selected_scene_paths.clear()
+        self._apply_scene_filter()
+        self._write("已取消场景卡筛选，恢复显示全部卡片的缺失 MOD。\n")
+
+    def open_scene_card_selector(self) -> None:
+        if not self.current_report:
+            messagebox.showinfo("尚无报告", "请先点击“追加解析”或“完整解析”。")
+            return
+        if not self.scene_cards:
+            messagebox.showinfo(
+                "没有场景卡",
+                "当前报告没有场景卡信息。若这是旧报告，请重新执行一次追加解析或完整解析。",
+            )
+            return
+
+        window = Toplevel(self.root)
+        window.title("选择场景卡（支持多选）")
+        window.geometry("1080x650")
+        window.minsize(900, 560)
+        window.transient(self.root)
+        window.grab_set()
+        draft_selected = set(self.selected_scene_paths)
+
+        body = Frame(window)
+        body.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        list_frame = Frame(body)
+        list_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 10))
+        preview_frame = Frame(body, width=440)
+        preview_frame.pack(side=RIGHT, fill=BOTH)
+        preview_frame.pack_propagate(False)
+
+        columns = ("selected", "filename", "mods", "missing", "path")
+        card_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="extended")
+        for column, title, width in (
+            ("selected", "选择", 48),
+            ("filename", "场景卡", 210),
+            ("mods", "全部 zipmod", 82),
+            ("missing", "缺失", 58),
+            ("path", "位置", 310),
+        ):
+            card_tree.heading(column, text=title)
+            card_tree.column(column, width=width, minwidth=45, anchor="w")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=card_tree.yview)
+        card_tree.configure(yscrollcommand=scrollbar.set)
+        card_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill="y")
+
+        iid_to_path: dict[str, str] = {}
+        path_to_iid: dict[str, str] = {}
+        for index, (path, card) in enumerate(self.scene_cards.items()):
+            iid = f"scene_{index}"
+            iid_to_path[iid] = path
+            path_to_iid[path] = iid
+            card_tree.insert(
+                "",
+                END,
+                iid=iid,
+                values=(
+                    "☑" if path in draft_selected else "☐",
+                    card.get("filename") or Path(path).name,
+                    int(card.get("mod_count") or len(card.get("mods", []))),
+                    int(
+                        card.get("missing_count")
+                        if card.get("missing_count") is not None
+                        else sum(not mod.get("installed") for mod in card.get("mods", []))
+                    ),
+                    path,
+                ),
+            )
+
+        Label(preview_frame, text="场景卡预览", font=("Microsoft YaHei UI", 11, "bold")).pack(
+            fill=X, pady=(4, 8)
+        )
+        preview_label = Label(
+            preview_frame,
+            text="单击左侧场景卡查看图片",
+            anchor="center",
+            justify="center",
+            bg="#202020",
+            fg="#eeeeee",
+        )
+        preview_label.pack(fill=BOTH, expand=True)
+        preview_info = StringVar(value="")
+        Label(
+            preview_frame,
+            textvariable=preview_info,
+            anchor="w",
+            justify=LEFT,
+            wraplength=420,
+        ).pack(fill=X, pady=(8, 0))
+
+        def refresh_card_row(path: str) -> None:
+            iid = path_to_iid[path]
+            values = list(card_tree.item(iid, "values"))
+            values[0] = "☑" if path in draft_selected else "☐"
+            card_tree.item(iid, values=values)
+
+        def show_preview(_event=None) -> None:
+            highlighted = card_tree.selection()
+            if not highlighted:
+                return
+            path = iid_to_path.get(str(highlighted[0]))
+            if not path:
+                return
+            card = self.scene_cards[path]
+            try:
+                image = PhotoImage(data=_png_preview_data(Path(path)), format="png")
+                factor = max(1, (image.width() + 419) // 420, (image.height() + 359) // 360)
+                if factor > 1:
+                    image = image.subsample(factor, factor)
+                self.scene_preview_image = image
+                preview_label.configure(image=image, text="")
+            except Exception as exc:
+                self.scene_preview_image = None
+                preview_label.configure(image="", text=f"无法读取预览\n{exc}")
+            preview_info.set(
+                f"{card.get('filename') or Path(path).name}\n"
+                f"全部 zipmod：{int(card.get('mod_count') or len(card.get('mods', [])))}　"
+                f"缺失：{int(card.get('missing_count') or 0)}\n{path}"
+            )
+
+        def toggle_highlighted(_event=None) -> None:
+            paths = [iid_to_path[str(iid)] for iid in card_tree.selection()]
+            if not paths:
+                messagebox.showinfo("请先选择", "请先单击或用 Ctrl/Shift 选择场景卡。", parent=window)
+                return
+            if all(path in draft_selected for path in paths):
+                draft_selected.difference_update(paths)
+            else:
+                draft_selected.update(paths)
+            for path in paths:
+                refresh_card_row(path)
+
+        def toggle_clicked(event) -> None:
+            iid = card_tree.identify_row(event.y)
+            if not iid:
+                return
+            card_tree.selection_set(iid)
+            show_preview()
+            toggle_highlighted()
+
+        def select_all_cards() -> None:
+            draft_selected.update(self.scene_cards)
+            for path in self.scene_cards:
+                refresh_card_row(path)
+
+        def clear_cards() -> None:
+            draft_selected.clear()
+            for path in self.scene_cards:
+                refresh_card_row(path)
+
+        def apply_cards() -> None:
+            self.selected_scene_paths = set(draft_selected)
+            self._apply_scene_filter()
+            if self.selected_scene_paths:
+                self._write(
+                    f"已按 {len(self.selected_scene_paths)} 张场景卡筛选。"
+                    "点击“全选可下载”即可只勾选这些场景卡的缺失 MOD。\n"
+                )
+            window.destroy()
+
+        card_tree.bind("<<TreeviewSelect>>", show_preview)
+        card_tree.bind("<Double-1>", toggle_clicked)
+        instruction = Label(
+            window,
+            text="单击查看图片；Ctrl/Shift 可高亮多张，双击可直接勾选或取消。应用后主列表会显示所选卡的全部依赖。",
+            anchor="w",
+        )
+        instruction.pack(fill=X, padx=10, pady=(0, 6))
+        buttons = Frame(window)
+        buttons.pack(fill=X, padx=10, pady=(0, 10))
+        Button(buttons, text="勾选/取消高亮卡", command=toggle_highlighted).pack(side=LEFT, padx=(0, 6))
+        Button(buttons, text="全选场景卡", command=select_all_cards).pack(side=LEFT, padx=(0, 6))
+        Button(buttons, text="清空选择", command=clear_cards).pack(side=LEFT, padx=(0, 6))
+        Button(buttons, text="应用筛选", command=apply_cards, width=14).pack(side=RIGHT)
+        Button(buttons, text="取消", command=window.destroy, width=10).pack(side=RIGHT, padx=(0, 6))
+        if card_tree.get_children():
+            first = card_tree.get_children()[0]
+            card_tree.selection_set(first)
+            card_tree.focus(first)
+            show_preview()
 
     def _refresh_row(self, key: str) -> None:
         item = self.items_by_guid[key]
-        state = self.task_states[key]
+        state = self.task_states.get(
+            key,
+            {
+                "status": item.get("status") or "unresolved",
+                "reason": item.get("reason") or "",
+                "downloaded": 0,
+                "total": int(item.get("file_size") or 0),
+            },
+        )
         status = str(state.get("status") or item.get("status") or "unresolved")
         downloaded = int(state.get("downloaded") or state.get("bytes") or 0)
         total = int(state.get("total") or item.get("file_size") or 0)
@@ -399,13 +769,22 @@ class App:
             self.selected_guids.discard(key)
         self._refresh_row(key)
 
+    def _is_downloadable_key(self, key: str) -> bool:
+        item = self.items_by_guid.get(key, {})
+        state = self.task_states.get(key, {})
+        return item.get("status") == "downloadable" and state.get("status") not in {
+            "installed",
+            "skipped",
+        }
+
     def _toggle_selected_row(self, event) -> None:
         key = self.tree.identify_row(event.y)
         if not key or key not in self.items_by_guid:
             return
-        item = self.items_by_guid[key]
-        if item.get("status") != "downloadable":
-            messagebox.showinfo("不可下载", "这个项目还没有解析到下载地址。")
+        if not self._is_downloadable_key(key):
+            status = self.task_states.get(key, {}).get("status") or self.items_by_guid[key].get("status")
+            message = "这个依赖已经安装，无需重复下载。" if status in {"satisfied", "installed", "skipped"} else "这个项目还没有解析到下载地址。"
+            messagebox.showinfo("不可下载", message)
             return
         if key in self.selected_guids:
             self.selected_guids.remove(key)
@@ -417,7 +796,7 @@ class App:
         return [str(key) for key in self.tree.selection() if str(key) in self.items_by_guid]
 
     def _toggle_highlighted_rows(self, _event=None) -> str:
-        keys = [key for key in self._selected_tree_keys() if self.items_by_guid[key].get("status") == "downloadable"]
+        keys = [key for key in self._selected_tree_keys() if self._is_downloadable_key(key)]
         if not keys:
             messagebox.showinfo("无可下载项", "请先高亮至少一个状态为“等待下载”的模组。")
             return "break"
@@ -484,7 +863,7 @@ class App:
         if not highlighted:
             messagebox.showinfo("请先选择", "请先用 Ctrl/Shift+单击高亮要下载的模组。")
             return
-        downloadable = [key for key in highlighted if self.items_by_guid[key].get("status") == "downloadable"]
+        downloadable = [key for key in highlighted if self._is_downloadable_key(key)]
         self.selected_guids.update(downloadable)
         for key in downloadable:
             self._refresh_row(key)
@@ -503,7 +882,7 @@ class App:
 
     def select_downloadable(self) -> None:
         self.selected_guids = {
-            key for key, item in self.items_by_guid.items() if item.get("status") == "downloadable"
+            key for key in self.items_by_guid if self._is_downloadable_key(key)
         }
         for key in self.items_by_guid:
             self._refresh_row(key)
@@ -512,7 +891,9 @@ class App:
         self.selected_guids = {
             key
             for key, state in self.task_states.items()
-            if state.get("status") == "failed" and self.items_by_guid[key].get("status") == "downloadable"
+            if key in self.items_by_guid
+            and state.get("status") == "failed"
+            and self.items_by_guid[key].get("status") == "downloadable"
         }
         for key in self.items_by_guid:
             self._refresh_row(key)
@@ -529,7 +910,7 @@ class App:
             messagebox.showinfo("尚无报告", "请先点击“追加解析”或“完整解析”。")
             return
         selected = {
-            key for key in self.selected_guids if self.items_by_guid[key].get("status") == "downloadable"
+            key for key in self.selected_guids if self._is_downloadable_key(key)
         }
         if not selected:
             messagebox.showinfo("没有任务", "请先勾选要下载的项目。双击任务行可以切换选择。")
