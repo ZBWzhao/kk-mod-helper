@@ -6,7 +6,7 @@ import queue
 import threading
 import traceback
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Button, Entry, Frame, Label, StringVar, Text, Tk, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, Button, Entry, Frame, Label, Menu, StringVar, Text, Tk, filedialog, messagebox
 from tkinter import ttk
 
 from .catalog import crawl_public_index, resolve_report
@@ -107,6 +107,7 @@ class App:
             Button(selection_frame, text="全选可下载", command=self.select_downloadable),
             Button(selection_frame, text="只选失败任务", command=self.select_failed),
             Button(selection_frame, text="清除选择", command=self.clear_selection),
+            Button(selection_frame, text="复制模组名称", command=self.copy_selected_mod_name),
         ]
         for button in self.selection_buttons:
             button.pack(side=LEFT, padx=(0, 6))
@@ -140,10 +141,20 @@ class App:
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
         yscroll.pack(side=RIGHT, fill="y")
         self.tree.bind("<Double-1>", self._toggle_selected_row)
+        self.tree.bind("<Button-3>", self._show_tree_menu)
+        self.tree.bind("<Control-c>", self.copy_selected_mod_name)
+
+        self.tree_menu = Menu(self.root, tearoff=False)
+        self.tree_menu.add_command(label="复制模组名称", command=self.copy_selected_mod_name)
+        self.tree_menu.add_command(label="复制 GUID", command=self.copy_selected_guid)
+        self.tree_menu.add_command(label="复制名称 + GUID", command=self.copy_selected_mod_info)
 
         self.log = Text(root, height=8, wrap="word")
         self.log.pack(fill=X, padx=10, pady=(4, 10))
-        self._write("程序会自动管理 JSON 报告。双击任务行可勾选或取消，下载失败项会保留供再次重试。\n")
+        self._write(
+            "程序会自动管理 JSON 报告。双击任务行可勾选或取消；"
+            "选中一行后可点击“复制模组名称”、右键或按 Ctrl+C 复制。\n"
+        )
         self.root.after(100, self._drain_messages)
         self.root.after(200, self._startup)
 
@@ -400,6 +411,58 @@ class App:
         else:
             self.selected_guids.add(key)
         self._refresh_row(key)
+
+    def _selected_tree_key(self) -> str | None:
+        selected = self.tree.selection()
+        if not selected:
+            return None
+        key = str(selected[0])
+        return key if key in self.items_by_guid else None
+
+    def _copy_text(self, text: str, description: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        self._write(f"已复制{description}：{text}\n")
+
+    def copy_selected_mod_name(self, _event=None) -> str:
+        key = self._selected_tree_key()
+        if not key:
+            messagebox.showinfo("请先选择", "请先单击选中一行模组。")
+            return "break"
+        item = self.items_by_guid[key]
+        name = str(item.get("name") or item.get("filename") or "未知模组")
+        self._copy_text(name, "模组名称")
+        return "break"
+
+    def copy_selected_guid(self) -> None:
+        key = self._selected_tree_key()
+        if not key:
+            messagebox.showinfo("请先选择", "请先单击选中一行模组。")
+            return
+        guid = str(self.items_by_guid[key].get("guid") or "")
+        self._copy_text(guid, " GUID")
+
+    def copy_selected_mod_info(self) -> None:
+        key = self._selected_tree_key()
+        if not key:
+            messagebox.showinfo("请先选择", "请先单击选中一行模组。")
+            return
+        item = self.items_by_guid[key]
+        name = str(item.get("name") or item.get("filename") or "未知模组")
+        guid = str(item.get("guid") or "")
+        self._copy_text(f"{name}\t{guid}", "模组名称和 GUID")
+
+    def _show_tree_menu(self, event) -> None:
+        key = self.tree.identify_row(event.y)
+        if not key or key not in self.items_by_guid:
+            return
+        self.tree.selection_set(key)
+        self.tree.focus(key)
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
 
     def select_downloadable(self) -> None:
         self.selected_guids = {
