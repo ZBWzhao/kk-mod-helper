@@ -97,7 +97,6 @@ D:\Games\Koikatu
 
 ## 安全说明
 
-- 工具不会破解登录，也不会读取 ModResolver 账号数据。
 - 不会删除现有 MOD，不会覆盖同名文件。
 - 只会自动安装 Sideloader `.zipmod`，不会安装 BepInEx 插件 DLL。
 - 无法可靠解析的 GUID 会保留为“未找到地址”，程序不会猜测下载或强行安装。
